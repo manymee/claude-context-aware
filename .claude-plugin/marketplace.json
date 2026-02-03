@@ -1,0 +1,12 @@
+{
+  "name": "manymee",
+  "owner": {
+    "name": "manymee"
+  },
+  "plugins": [
+    {
+      "name": "context-aware",
+      "source": "./"
+    }
+  ]
+}

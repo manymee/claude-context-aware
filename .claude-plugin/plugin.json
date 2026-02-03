@@ -1,0 +1,9 @@
+{
+  "name": "context-aware",
+  "description": "Monitor context window usage and get recommendations for handoffs before exhaustion",
+  "version": "1.0.0",
+  "author": {
+    "name": "manymee"
+  },
+  "repository": "https://github.com/manymee/claude-context-aware"
+}
