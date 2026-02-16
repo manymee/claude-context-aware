@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "context-aware",
-      "source": "./"
+      "source": "./plugins/context-aware"
     }
   ]
 }
