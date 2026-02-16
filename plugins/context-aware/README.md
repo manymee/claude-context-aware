@@ -30,7 +30,7 @@ Claude sees this message and can decide whether to prepare a handoff or continue
 | 40% | Context at {percent}% — Consider preparing a handoff soon. |
 | 50% | Context at {percent}% — Handoff recommended. |
 | 60% | Context at {percent}% — Handoff strongly recommended. |
-| 65% | Context at {percent}% — Auto-compaction risk. Handoff advised. |
+| 70% | Context at {percent}% — Auto-compaction risk. Handoff advised. |
 
 ## Configuration
 
