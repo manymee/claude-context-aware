@@ -1,12 +1,60 @@
 #!/bin/bash
 set -euo pipefail
 
-readonly THRESHOLD_WRAPPING_UP="${CONTEXT_AWARE_THRESHOLD_WRAPPING_UP:-40}"
-readonly THRESHOLD_HANDOFF="${CONTEXT_AWARE_THRESHOLD_HANDOFF:-50}"
-readonly THRESHOLD_OVERSHOT="${CONTEXT_AWARE_THRESHOLD_OVERSHOT:-60}"
-readonly THRESHOLD_CRITICAL="${CONTEXT_AWARE_THRESHOLD_CRITICAL:-65}"
-readonly DEFAULT_CONTEXT_SIZE="${CONTEXT_AWARE_DEFAULT_CONTEXT_SIZE:-200000}"
-readonly DEBUG="${CONTEXT_AWARE_DEBUG:-}"
+if ! command -v jq &>/dev/null; then
+  echo "Error: jq is required but not found." >&2
+  exit 1
+fi
+
+readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+CONFIG_JSON=""      # set by load_config()
+CONFIG_WARNING=""   # set by load_config() on validation failure
+
+validate_config() {
+  local config="$1"
+
+  echo "$config" | jq -e '
+    (.thresholds | type == "array" and length > 0) and
+    (.thresholds | all(
+      (.percent | type == "number" and . >= 0 and . <= 100) and
+      (.message | type == "string" and length > 0)
+    )) and
+    (if has("context_size") then .context_size | type == "number" and . > 0 else true end) and
+    (if has("debug") then .debug | type == "boolean" else true end)
+  ' >/dev/null 2>&1
+}
+
+load_config() {
+  local config_paths=()
+
+  if [[ -n "${CONTEXT_AWARE_CONFIG:-}" ]]; then
+    config_paths+=("$CONTEXT_AWARE_CONFIG")
+  fi
+  if [[ -n "${CLAUDE_PROJECT_DIR:-}" ]]; then
+    config_paths+=("$CLAUDE_PROJECT_DIR/.claude/context-aware.json")
+  fi
+  config_paths+=("$HOME/.claude/context-aware.json")
+
+  local default_config_path="$PLUGIN_ROOT/default-config.json"
+
+  for config_path in "${config_paths[@]}"; do
+    if [[ -f "$config_path" ]]; then
+      local candidate
+      candidate=$(cat "$config_path")
+      if validate_config "$candidate"; then
+        CONFIG_JSON="$candidate"
+        return
+      else
+        CONFIG_WARNING="[context-aware hook] Invalid config at $config_path — using default config."
+        echo "Warning: $CONFIG_WARNING" >&2
+        break
+      fi
+    fi
+  done
+
+  CONFIG_JSON=$(cat "$default_config_path")
+}
 
 exit_if_already_blocked() {
   local input="$1"
@@ -22,21 +70,23 @@ get_transcript_path() {
   local transcript_path
   transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
   if [[ -z "$transcript_path" || ! -f "$transcript_path" ]]; then
-    exit 1
+    return 1
   fi
   echo "$transcript_path"
 }
 
 get_context_size_for_model() {
   local model="$1"
+  local default_size
+  default_size=$(echo "$CONFIG_JSON" | jq '.context_size // 200000')
 
   # All current Claude models have 200K context
   case "$model" in
     claude-opus-4-5*|claude-3-5*|claude-3-opus*|claude-3-sonnet*|claude-3-haiku*)
-      echo "$DEFAULT_CONTEXT_SIZE"
+      echo "$default_size"
       ;;
     *)
-      echo "$DEFAULT_CONTEXT_SIZE"
+      echo "$default_size"
       ;;
   esac
 }
@@ -63,18 +113,24 @@ get_token_count() {
 
 get_reason() {
   local percentage=$1
-  local prefix="[Hook] Context at ${percentage}% —"
 
-  if [[ $percentage -lt $THRESHOLD_WRAPPING_UP ]]; then
-    return 1  # No action needed
-  elif [[ $percentage -lt $THRESHOLD_HANDOFF ]]; then
-    echo "$prefix Consider preparing a handoff soon."
-  elif [[ $percentage -lt $THRESHOLD_OVERSHOT ]]; then
-    echo "$prefix Handoff recommended."
-  elif [[ $percentage -lt $THRESHOLD_CRITICAL ]]; then
-    echo "$prefix Handoff strongly recommended."
-  else
-    echo "$prefix Auto-compaction risk. Handoff advised."
+  local message
+  message=$(echo "$CONFIG_JSON" | jq -r --argjson pct "$percentage" '
+    .thresholds | sort_by(.percent) | map(select(.percent <= $pct)) | last | .message // empty
+  ')
+
+  if [[ -z "$message" ]]; then
+    return 1
+  fi
+
+  # Interpolate {percent} in message template
+  message="${message//\{percent\}/$percentage}"
+  echo "[context-aware hook] $message"
+}
+
+output_config_warning() {
+  if [[ -n "$CONFIG_WARNING" ]]; then
+    jq -n --arg sys "$CONFIG_WARNING" '{"decision": "approve", "systemMessage": $sys}'
   fi
 }
 
@@ -82,9 +138,24 @@ output_block_decision() {
   local reason="$1"
   local input="$2"
 
-  if [[ -n "$DEBUG" ]]; then
-    jq -n --arg reason "$reason" --arg debug "$input" \
-      '{"decision": "block", "reason": $reason, "systemMessage": $debug}'
+  local debug
+  debug=$(echo "$CONFIG_JSON" | jq -r '.debug // false')
+
+  local system_message=""
+  if [[ -n "$CONFIG_WARNING" ]]; then
+    system_message="$CONFIG_WARNING"
+  fi
+  if [[ "$debug" == "true" ]]; then
+    if [[ -n "$system_message" ]]; then
+      system_message="$system_message"$'\n'"$input"
+    else
+      system_message="$input"
+    fi
+  fi
+
+  if [[ -n "$system_message" ]]; then
+    jq -n --arg reason "$reason" --arg sys "$system_message" \
+      '{"decision": "block", "reason": $reason, "systemMessage": $sys}'
   else
     jq -n --arg reason "$reason" \
       '{"decision": "block", "reason": $reason}'
@@ -98,8 +169,13 @@ main() {
   # Prevent infinite loops: if we already blocked once, let Claude stop
   exit_if_already_blocked "$input"
 
+  load_config
+
   local transcript_path
-  transcript_path=$(get_transcript_path "$input")
+  if ! transcript_path=$(get_transcript_path "$input"); then
+    output_config_warning
+    exit 0
+  fi
 
   local context_size
   context_size=$(get_context_size "$transcript_path")
@@ -110,8 +186,12 @@ main() {
   local percentage=$((token_count * 100 / context_size))
 
   local reason
-  reason=$(get_reason "$percentage") || exit 0
+  if ! reason=$(get_reason "$percentage"); then
+    output_config_warning
+    exit 0
+  fi
 
+  # Threshold met — block; config warning (if any) goes in systemMessage via output_block_decision
   output_block_decision "$reason" "$input"
 }
 
