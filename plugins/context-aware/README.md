@@ -80,6 +80,10 @@ Set via `~/.claude/settings.json`:
 }
 ```
 
+## Known Issues
+
+**"Local plugins cannot be updated remotely"** — Claude Code shows this warning in the plugin management UI. This happens because the marketplace hosts the plugin in a subdirectory of the same repo (`./plugins/context-aware`), which Claude Code interprets as a local source. The plugin still receives updates normally — the warning is cosmetic. Moving the plugin to its own repo might fix it.
+
 ### Example: project-level config
 
 Create `.claude/context-aware.json` in your project root:
